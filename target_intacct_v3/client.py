@@ -28,6 +28,8 @@ class IntacctSink(HotglueSink):
     departments = None
     departments_recordno = None
     items = None
+    contacts = None
+    payment_terms = None
     previous_stream = None
     controlid_list = []
 
@@ -368,6 +370,19 @@ class IntacctSink(HotglueSink):
             items = self.get_records("ITEM", ["ITEMID", "NAME"])
             IntacctSink.items = dictify(items, "NAME", "ITEMID")
         return IntacctSink.items
+
+    def get_contacts(self):
+        if IntacctSink.contacts is None:
+            contacts = self.get_records("CONTACT", ["RECORDNO", "CONTACTNAME"])
+            IntacctSink.contacts = dictify(contacts, "CONTACTNAME", "RECORDNO")
+        return IntacctSink.contacts
+
+    def get_payment_terms(self):
+        if IntacctSink.payment_terms is None:
+            terms = self.get_records("APTERM", ["NAME"])
+            # keyed lowercase so a term matches regardless of case, value keeps Intacct's own spelling
+            IntacctSink.payment_terms = {t["NAME"].lower(): t["NAME"] for t in terms if t.get("NAME")}
+        return IntacctSink.payment_terms
 
     def prepare_attachment_payload(
         self, attachments, supdoc_id, existing_attachments=None, folder_id=None

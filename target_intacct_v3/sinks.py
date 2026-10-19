@@ -3,6 +3,8 @@
 
 import re
 
+from singer_sdk.exceptions import FatalAPIError
+
 from target_intacct_v3.client import IntacctSink
 from target_intacct_v3.util import *
 
@@ -12,6 +14,105 @@ class Suppliers(IntacctSink):
     """IntacctV3 target sink class."""
 
     name = "Suppliers"
+    # Intacct's separator for multi-pick-list custom field values
+    MULTI_PICK_SEPARATOR = "#~#"
+    DEFAULT_CONTACT_CATEGORY = "Contact"
+
+    def get_term_name(self, term_name):
+        """Return Intacct's own spelling of an AP term, or None (with a warning) if it doesn't exist there."""
+        if not term_name:
+            return None
+        term = self.get_payment_terms().get(str(term_name).strip().lower())
+        if not term:
+            self.logger.warning(
+                f"Payment term '{term_name}' not found in Intacct AP terms - sending vendor without TERMNAME"
+            )
+        return term
+
+    @staticmethod
+    def as_list(value):
+        # list fields may arrive as JSON/repr strings, or as NaN/None when a row has no value
+        value = parse_objs(value)
+        return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+    def map_custom_fields(self, custom_fields):
+        mapped = {}
+        for cf in self.as_list(custom_fields):
+            name = cf.get("name")
+            value = cf.get("value")
+            if isinstance(value, list):
+                value = self.MULTI_PICK_SEPARATOR.join(str(v) for v in value if v not in (None, ""))
+            if not name or value in (None, ""):
+                continue
+            mapped[name] = value
+        return mapped
+
+    def map_contacts(self, contacts):
+        mapped = []
+        for contact in self.as_list(contacts):
+            contact = {
+                "name": contact.get("name"),
+                "email": contact.get("email"),
+                "phone": contact.get("phone"),
+                "category": contact.get("category"),
+            }
+            if contact["name"] or contact["email"] or contact["phone"]:
+                mapped.append(contact)
+        return mapped
+
+    def get_vendor_key(self, vendor):
+        """Stable vendor identifier used to keep the vendor's contact names unique in Intacct."""
+        if vendor.get("VENDORID"):
+            return vendor["VENDORID"]
+        recordno = vendor.get("RECORDNO")
+        if recordno and IntacctSink.vendors_recordno:
+            try:
+                recordno = str(int(float(recordno)))
+            except (TypeError, ValueError):
+                recordno = str(recordno)
+            if IntacctSink.vendors_recordno.get(recordno):
+                return IntacctSink.vendors_recordno[recordno]
+        return vendor.get("NAME")
+
+    def upsert_contacts(self, contacts, vendor):
+        """Create/update a CONTACT per vendor contact and return [(category, CONTACTNAME)] that exist in Intacct.
+
+        Intacct contacts are standalone records referenced by a company-wide unique CONTACTNAME,
+        so the vendor key is appended to keep same-named people of different vendors apart.
+        """
+        vendor_key = self.get_vendor_key(vendor)
+        existing_contacts = self.get_contacts()
+        upserted = []
+        used_names = set()
+
+        for contact in contacts:
+            print_as = contact["name"] or contact["email"] or contact["phone"]
+            contact_name = f"{print_as} ({vendor_key})"
+            if contact_name in used_names:
+                # two contacts with the same name on one vendor - tell them apart by email/phone
+                contact_name = f"{print_as} {contact['email'] or contact['phone']} ({vendor_key})"
+            used_names.add(contact_name)
+
+            payload = clean_convert({
+                "CONTACTNAME": contact_name,
+                "PRINTAS": print_as,
+                "COMPANYNAME": vendor.get("NAME"),
+                "EMAIL1": contact["email"],
+                "PHONE1": contact["phone"],
+            })
+            action = "update" if contact_name in existing_contacts else "create"
+            try:
+                response = self.request_api("POST", request_data={action: {"CONTACT": payload}})
+            except FatalAPIError as e:
+                self.logger.error(f"Failed to {action} contact '{contact_name}', skipping it: {e}")
+                continue
+
+            if action == "create":
+                recordno = (response.get("data", {}).get("contact") or {}).get("RECORDNO")
+                existing_contacts[contact_name] = recordno
+            upserted.append((contact["category"] or self.DEFAULT_CONTACT_CATEGORY, contact_name))
+
+        return upserted
 
     def preprocess_record(self, record: dict, context: dict) -> dict:
         try:
@@ -30,8 +131,11 @@ class Suppliers(IntacctSink):
                 "NAME": record.get("vendorName"),
                 "CURRENCY": record.get("currency"),
                 "COMMENTS": record.get("note"),
-                "PHONE1": phone.get("number"),
+                "TAXID": record.get("taxNumber"),
+                "TERMNAME": self.get_term_name(record.get("paymentTerm")),
                 "DISPLAYCONTACT": {
+                    # PHONE1 is a DISPLAYCONTACT field, Intacct has no top-level VENDOR.PHONE1
+                    "PHONE1": phone.get("number"),
                     "MAILADDRESS": {
                         "ADDRESS1": address.get("line1"),
                         "ADDRESS2": address.get("line2"),
@@ -42,6 +146,13 @@ class Suppliers(IntacctSink):
                     }
                 },
             }
+
+            # custom fields are sent as top-level VENDOR fields named by their Intacct field ID
+            for name, value in self.map_custom_fields(record.get("customFields")).items():
+                if name in payload:
+                    self.logger.warning(f"Skipping custom field '{name}' - it clashes with a standard VENDOR field")
+                    continue
+                payload[name] = value
 
             if record.get("id"):
                 payload["RECORDNO"] = record["id"]
@@ -74,7 +185,14 @@ class Suppliers(IntacctSink):
                             "error": f"Skipping vendor because VENDORID is either missing or has unsupported chars. Only letters, numbers and dashes accepted."
                         }
             payload = clean_convert(payload)
-            return {"VENDOR": payload}
+            # an empty MAILADDRESS/DISPLAYCONTACT on update could blank what Intacct already has
+            display_contact = payload.get("DISPLAYCONTACT", {})
+            if not display_contact.get("MAILADDRESS"):
+                display_contact.pop("MAILADDRESS", None)
+            if not display_contact and payload.get("RECORDNO"):
+                payload.pop("DISPLAYCONTACT", None)
+            # contacts are separate Intacct records - created in upsert_record, then linked to the vendor
+            return {"VENDOR": payload, "contacts": self.map_contacts(record.get("contacts"))}
         except Exception as e:
             return {"error": e.__repr__()}
 
@@ -84,6 +202,18 @@ class Suppliers(IntacctSink):
         if record.get("error"):
             raise Exception(record["error"])
         if record:
+            contacts = record.pop("contacts", None)
+            if contacts:
+                linked_contacts = self.upsert_contacts(contacts, record["VENDOR"])
+                if linked_contacts:
+                    # first contact becomes the vendor's primary contact; the list is append-only on
+                    # Intacct's side (existing entries are kept, duplicates skipped)
+                    record["VENDOR"]["CONTACTINFO"] = {"CONTACTNAME": linked_contacts[0][1]}
+                    record["VENDOR"]["CONTACT_LIST_INFO"] = [
+                        {"CATEGORYNAME": category, "CONTACT": {"NAME": contact_name}}
+                        for category, contact_name in linked_contacts
+                    ]
+
             vendor_recordno = record.get("VENDOR", {}).get("RECORDNO")
             vendor_id = record.get("VENDOR", {}).get("VENDORID")
             if vendor_recordno or \

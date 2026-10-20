@@ -470,7 +470,7 @@ class IntacctSink(HotglueSink):
             existing_attachments_data = supdoc.get("attachments", {}).get("attachment")
             if isinstance(existing_attachments_data, dict):
                 existing_attachments["names"] = [existing_attachments_data.get("attachmentname")]
-                existing_attachments["content"] = existing_attachments_data.get("attachmentdata")
+                existing_attachments["content"] = [existing_attachments_data.get("attachmentdata")]
             elif isinstance(existing_attachments_data, list):
                 existing_attachments["names"] = [att.get("attachmentname") for att in existing_attachments_data]
                 existing_attachments["content"] = [att.get("attachmentdata") for att in existing_attachments_data]

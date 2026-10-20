@@ -192,7 +192,11 @@ class Suppliers(IntacctSink):
             if not display_contact and payload.get("RECORDNO"):
                 payload.pop("DISPLAYCONTACT", None)
             # contacts are separate Intacct records - created in upsert_record, then linked to the vendor
-            return {"VENDOR": payload, "contacts": self.map_contacts(record.get("contacts"))}
+            return {
+                "VENDOR": payload,
+                "contacts": self.map_contacts(record.get("contacts")),
+                "attachments": record.get("attachments"),
+            }
         except Exception as e:
             return {"error": e.__repr__()}
 
@@ -203,6 +207,7 @@ class Suppliers(IntacctSink):
             raise Exception(record["error"])
         if record:
             contacts = record.pop("contacts", None)
+            attachments = record.pop("attachments", None)
             if contacts:
                 linked_contacts = self.upsert_contacts(contacts, record["VENDOR"])
                 if linked_contacts:
@@ -222,10 +227,53 @@ class Suppliers(IntacctSink):
                 state_updates["is_updated"] = True
             else:
                 action = "create"
-            response = self.request_api("POST", request_data={action: record})
+
+            supdoc_id = self.post_vendor_attachments(attachments, record["VENDOR"])
+
+            try:
+                response = self.request_api("POST", request_data={action: record})
+            except Exception as e:
+                if supdoc_id and action == "create":
+                    try:
+                        self.logger.info(f"Deleting attachments for failed vendor creation (SUPDOCID {supdoc_id})...")
+                        self.request_api("POST", request_data={"delete_supdoc": {"@key": supdoc_id}})
+                    except Exception as delete_error:
+                        self.logger.error(f"Failed to delete attachments with SUPDOCID {supdoc_id}: {delete_error}")
+                raise
             id = response["data"]["vendor"]["RECORDNO"]
             state_updates = self.get_record_url("VENDOR", id, state_updates)
             return id, True, state_updates
+
+    def post_vendor_attachments(self, attachments, vendor):
+        """Upload the vendor's attachments into a supdoc keyed by VENDORID and link it to the vendor.
+
+        Attachments are only ever added - a file removed in the source stays in Intacct, since
+        Intacct can't remove a single file from a supdoc. A failed upload is logged and the vendor
+        is still sent without it.
+        """
+        if not attachments or (isinstance(attachments, float) and attachments != attachments):
+            return None
+
+        vendor_id = vendor.get("VENDORID")
+        recordno = vendor.get("RECORDNO")
+        if recordno and IntacctSink.vendors_recordno:
+            try:
+                recordno = str(int(float(recordno)))
+            except (TypeError, ValueError):
+                recordno = str(recordno)
+            vendor_id = IntacctSink.vendors_recordno.get(recordno) or vendor_id
+        if not vendor_id:
+            self.logger.error("No VENDORID found for the vendor. Skipping sending attachments as no pk was found to create the folder and/or supdoc.")
+            return None
+
+        try:
+            supdoc_id = self.post_attachments(attachments, vendor_id)
+        except Exception as e:
+            self.logger.error(f"Failed to post attachments for VENDORID {vendor_id}, sending the vendor without them: {e}")
+            return None
+        if supdoc_id:
+            vendor["SUPDOCID"] = supdoc_id
+        return supdoc_id
 
 
 class APAdjustments(IntacctSink):
